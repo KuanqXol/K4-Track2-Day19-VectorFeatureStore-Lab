@@ -29,9 +29,11 @@ import httpx
 # này khởi động uvicorn ở background subprocess và đợi `/healthz` trả ready.
 
 # %%
+import sys
+
 ROOT = Path(_setup.__file__).resolve().parent.parent
 proc = subprocess.Popen(
-    ["uvicorn", "app.main:app", "--port", "8000", "--log-level", "warning"],
+    [sys.executable, "-m", "uvicorn", "app.main:app", "--port", "8000", "--log-level", "warning"],
     cwd=str(ROOT),
 )
 
@@ -88,12 +90,13 @@ def percentile(values: list[float], p: float) -> float:
 def benchmark_mode(mode: str, reps: int = 2) -> dict[str, float]:
     server_latencies: list[float] = []
     wall_latencies: list[float] = []
-    for _ in range(reps):
-        for q in golden:
-            t0 = time.perf_counter()
-            r = httpx.get(f"{URL}/search", params={"q": q["query"], "mode": mode})
-            wall_latencies.append((time.perf_counter() - t0) * 1000)
-            server_latencies.append(r.json()["latency_ms"])
+    with httpx.Client(base_url=URL, timeout=10.0) as client:
+        for _ in range(reps):
+            for q in golden:
+                t0 = time.perf_counter()
+                r = client.get("/search", params={"q": q["query"], "mode": mode})
+                wall_latencies.append((time.perf_counter() - t0) * 1000)
+                server_latencies.append(r.json()["latency_ms"])
     return {
         "p50_server": percentile(server_latencies, 0.50),
         "p95_server": percentile(server_latencies, 0.95),
@@ -101,6 +104,10 @@ def benchmark_mode(mode: str, reps: int = 2) -> dict[str, float]:
         "p99_wall":   percentile(wall_latencies, 0.99),
     }
 
+
+# Warm-up queries to eliminate cold start tail latency
+for q in golden[:5]:
+    httpx.get(f"{URL}/search", params={"q": q["query"], "mode": "hybrid"})
 
 print(f"  {'mode':10}  {'P50':>7}  {'P95':>7}  {'P99':>7}  {'P99(wall)':>9}")
 results = {}
@@ -127,8 +134,18 @@ else:
 # ## 5. Cleanup — stop the API server
 
 # %%
-proc.terminate()
-proc.wait(timeout=5)
+try:
+    import psutil
+    parent = psutil.Process(proc.pid)
+    for child in parent.children(recursive=True):
+        child.kill()
+    parent.kill()
+except Exception:
+    proc.terminate()
+    try:
+        proc.wait(timeout=3)
+    except Exception:
+        proc.kill()
 print("API server stopped")
 
 # %% [markdown]
